@@ -1,0 +1,1068 @@
+---
+title: "ApplicationofMachinelearninginSurv"
+author: "Tshepiso Mokoena"
+date: "2025-11-19"
+output:
+  word_document: default
+  html_document: default
+---
+#install.packages(c(
+  "survival",
+  "survminer",
+  "dplyr",
+  "caret",
+  "glmnet",
+  "xgboost",
+  "boot",
+  "pROC",
+  "survcomp",
+  "randomForestSRC",
+  "survivalmodels",
+  "reticulate","riskRegression","timeROC","pec","readr"))
+  
+#The dataset contains survival information for patients with advanced lung cancer, including both clinical and demographic variables. Each record represents an individual patient, with time indicating survival duration in days and status denoting the event indicator (0 = censored/alive, 1 = dead). Patient demographics include age in years and sex coded as 1 for male and 2 for female. Functional status is captured using two physician-rated measures: ph.ecog, the Eastern Cooperative Oncology Group (ECOG) performance score ranging from 0 (asymptomatic) to 4 (bedbound), and ph.karno, the Karnofsky performance score (0–100, higher values indicating better health). Patients also self-assessed their functional status via pat.karno (0–100). Additional lifestyle and clinical covariates include meal.cal, the average daily caloric intake, and wt.loss, the weight lost in the last six months in pounds. 
+
+```{r Load packages}
+
+#install.packages(c("survival",
+"survminer",
+"dplyr",
+"caret",
+"glmnet",
+"xgboost",
+"boot",
+"pROC",
+"survcomp",
+"randomForestSRC",
+"survivalmodels",
+"reticulate","riskRegression","timeROC","pec","readr"))
+```
+
+```{r}
+
+library(survival)   
+library(survminer) 
+library(readr)
+library(dplyr)        
+library(caret)           # Machine learning workflow: data splitting, cross-validation,preprocessing
+library(glmnet)          # Penalized regression models: Lasso, Ridge, and Elastic Net for linear,
+library(xgboost)         # Gradient boosting framework 
+library(boot)            # Bootstrap resampling and confidence interval estimation
+library(pROC)            # Receiver Operating Characteristic (ROC) analysis and AUC computation
+library(survcomp)        # Survival model evaluation: concordance index, performance metrics
+library(randomForestSRC) # Random survival forests for right-censored survival data
+library(survivalmodels)  # Deep learning survival models (e.g., DeepSurv) via reticulate/Pycox
+library(reticulate)      # Interface to Python from R: required for Pycox/DeepSurv integration
+library(riskRegression)  #  Score(), calibration plots, IPCW-adjusted metrics
+library(timeROC)         # Time-dependent ROC curves and AUC for censored survival data
+library(pec)             # Prediction error curves, calibration, and model validation
+```
+
+```{r Data}
+set.seed(123)
+data_clean <- read.csv("D:/OneDrive/Desktop/ML Short Course/completed_data1.csv")
+str(data_clean)
+summary(data_clean)
+
+```
+```{r}
+
+
+cont_vars <- c("age","ph.karno","pat.karno","meal.cal","wt.loss")
+
+# Shapiro-Wilk test
+for (v in cont_vars) {
+  cat("\nVariable:", v, "\n")
+  print(shapiro.test(data_clean[[v]]))
+}
+
+# Histograms + Density + QQ plots
+library(ggplot2)
+library(gridExtra)
+
+
+plot_list <- list()
+for (v in cont_vars) {
+  df <- data.frame(x = data_clean[[v]])
+  
+  # Histogram 
+  p1 <- ggplot(df, aes(x)) +
+    geom_histogram(bins = 20, fill = "skyblue", color = "black") +
+    labs(title = paste("Histogram:", v), x = v, y = "Count")
+  
+  # Q-Q plot
+  p2 <- ggplot(df, aes(sample = x)) +
+    stat_qq() + stat_qq_line(color = "red") +
+    labs(title = paste("Q-Q Plot:", v))
+  
+  plot_list[[v]] <- gridExtra::arrangeGrob(p1, p2, ncol = 2)
+}
+
+
+gridExtra::grid.arrange(grobs = plot_list, ncol = 1)
+
+data_clean %>%
+  group_by(status) %>%
+  summarise(
+    Median_time = median(time, na.rm = TRUE),
+    Q1_time = quantile(time, 0.25, na.rm = TRUE),
+    Q3_time = quantile(time, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+data_clean %>%
+  group_by(status) %>%
+  summarise(
+    Median_age = median(age, na.rm = TRUE),
+    Q1_age = quantile(age, 0.25, na.rm = TRUE),
+    Q3_age = quantile(age, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+```
+
+
+```{r}
+# Outcomes + features
+outcomes_analysis <-data_clean %>%
+  dplyr::mutate(
+    surv_time  = time,
+    surv_event = status,
+    death_100d   = ifelse(time <= 100  & status == 1, 1, 0),
+    death_250d  = ifelse(time <= 250 & status == 1, 1, 0),
+    death_400d  = ifelse(time <= 400 & status == 1, 1, 0)
+  )
+
+predictors <- c("age","sex","ph.ecog","ph.karno","pat.karno","meal.cal","wt.loss")
+
+```
+
+#The make_design_matrix function converts selected columns from a data frame into a numeric matrix for modeling. It uses model.matrix() to handle factor variables via one-hot encoding and dynamically builds the formula from the predictors vector.
+```{r Unified design matrix builder}
+# Unified design matrix builder
+make_design_matrix <- function(df, predictors) {
+  mm <- model.matrix(
+    as.formula(paste("~", paste(predictors, collapse = " + "))),
+    data = df
+  )
+  mm[, -1, drop = FALSE]  # drop intercept
+}
+
+```
+# ============================================================
+# Nested CV setup
+# ============================================================
+```{r Define Fold Counts}
+
+
+set.seed(123)
+
+n_outer_folds <- 5 #Used to estimate model performance on unseen data
+n_inner_folds <- 3#Used for hyperparameter tuning within each outer fold.
+```
+
+```{r Create Outer Folds}
+
+#stratified splitting
+outer_folds <- createFolds(outcomes_analysis$surv_event, k = n_outer_folds)
+
+
+
+nested_cv_results <- data.frame()
+
+
+
+```
+# ============================================================
+# Outer loop - fit models only
+# ============================================================
+
+#Training data (train_data) is used for model development — including inner CV, hyperparameter tuning, and fitting.
+
+#Test data (test_data) is used only for final model perf Outcome extraction, scoring, plots
+
+#test_X	Numeric predictors (matrix)	- Predictions from trained models
+```{r}
+
+#Iterates(full training + testing cycle.) over each outer fold 1 to 5.
+
+for (fold_i in seq_len(n_outer_folds)) {
+
+  cat(sprintf("\n--- Outer Fold %d/%d ---\n", fold_i, n_outer_folds))
+  
+  test_idx  <- outer_folds[[fold_i]]
+  train_idx <- setdiff(seq_len(nrow(outcomes_analysis)), test_idx)
+  
+  train_data <- outcomes_analysis[train_idx, ]
+  test_data  <- outcomes_analysis[test_idx, ] #held-out test set
+  
+  train_X <- make_design_matrix(train_data, predictors )
+  test_X  <- make_design_matrix(test_data, predictors )
+  
+  train_surv <- Surv(train_data$surv_time, train_data$surv_event) #Survival outcome used to fit models
+} 
+  fold_results <- data.frame()
+```
+
+```{r Model Development inside the outer fold.}
+  
+  # ============================================================
+  # LASSO Cox
+  # ============================================================
+  tryCatch({
+    lasso_model <- cv.glmnet(train_X, train_surv, family="cox", alpha=1, nfolds=n_inner_folds)
+    lasso_lp <- as.numeric(predict(lasso_model, newx=test_X, s="lambda.min", type="link"))
+    
+    fold_results <- rbind(fold_results,
+                          data.frame(Model="Lasso", Fold=fold_i))
+  })
+  
+  # ============================================================
+  # Ridge Cox
+  # ============================================================
+  tryCatch({
+    ridge_model <- cv.glmnet(train_X, train_surv, family="cox", alpha=0, nfolds=n_inner_folds)
+    ridge_lp <- as.numeric(predict(ridge_model, newx=test_X, s="lambda.min", type="link"))
+    
+    fold_results <- rbind(fold_results,
+                          data.frame(Model="Ridge", Fold=fold_i))
+  })
+  
+  # ============================================================
+  # Elastic Net Cox
+  # ============================================================
+  tryCatch({
+    elastic_model <- cv.glmnet(train_X, train_surv, family="cox", alpha=0.5, nfolds=n_inner_folds)
+    elastic_lp <- as.numeric(predict(elastic_model, newx=test_X, s="lambda.min", type="link"))
+    
+    fold_results <- rbind(fold_results,
+                          data.frame(Model="ElasticNet", Fold=fold_i))
+  })
+  
+  # ============================================================
+  # Random Survival Forest
+  # ============================================================
+  tryCatch({
+    rsf_model <- rfsrc(
+      Surv(surv_time, surv_event) ~ .,
+      data = train_data[, c("surv_time", "surv_event",predictors)],
+      ntree = 100 )
+    rsf_pred <- predict(rsf_model, newdata = test_data[, c("surv_time", "surv_event", predictors)])
+    rsf_lp   <- rowSums(rsf_pred$chf)
+    
+    fold_results <- rbind(fold_results,
+                          data.frame(Model="RSF", Fold=fold_i))
+  })
+  
+  
+  # ============================================================
+  # XGBoost Cox
+  # ============================================================
+  tryCatch({
+    
+    dtrain <- xgb.DMatrix(data  = as.matrix(train_X),label = train_data$surv_time)
+    
+    xgb_model <- xgb.train(
+      params = list(
+        objective = "survival:cox",
+        eval_metric = "cox-nloglik",
+        eta = 0.05,
+        max_depth = 3,
+        subsample = 0.8,
+        colsample_bytree = 0.8
+      ),
+      data    = dtrain,
+      nrounds = 300,
+      verbose = 0
+    )
+    
+    dtest <- xgb.DMatrix(data = as.matrix(test_X))
+    xgb_lp <- as.numeric(predict(xgb_model, dtest)) #linear predictors
+    
+    fold_results <- rbind(fold_results,
+                          data.frame(Model="XGBoost", Fold=fold_i))
+    
+  }, error = function(e) {
+    message("XGBoost failed on fold ", fold_i, ": ", e$message)
+  })
+  
+
+ fold_results
+```
+
+
+```{r  models_fold}
+
+models_fold <- list(
+    
+    Lasso   = lasso_model,
+    Ridge   = ridge_model,
+    Elastic = elastic_model,
+    RSF     = rsf_model,
+    XGB     = xgb_model
+    
+  )
+
+  fold_results <- models_fold
+
+```
+# ============================================================
+# Time-dependent evaluation on test folds
+# ============================================================
+```{r #  Cindex}
+library(boot)
+
+#The concordance index (C-index) is a widely used metric in survival analysis that measures the discriminative ability of a model, how well the model can correctly rank individuals according to risk.C-index	Interpretation
+#0.5	Model performs no better than random chance
+#1.0	Perfect discrimination; all high-risk patients fail before low-risk patients
+#<0.5	Predictions are worse than random 
+
+#reusable function to bootstrap the C-index.
+bootstrap_cindex_lp <- function(data, lp, R = 500, seed = 123) {
+  set.seed(seed)
+  
+  boot_stat <- function(d, i) {
+  concordance.index(lp[i], surv.time = d$surv_time[i], surv.event = d$surv_event[i])$c.index
+  }  #Returns C-index for that bootstrap sample.
+  
+  boot(data = data, statistic = boot_stat, R = R)
+}
+boot_lasso_cindex   <- bootstrap_cindex_lp(test_data, lasso_lp)
+boot_ridge_cindex   <- bootstrap_cindex_lp(test_data, ridge_lp)
+boot_elastic_cindex <- bootstrap_cindex_lp(test_data, elastic_lp)
+boot_rsf_cindex    <- bootstrap_cindex_lp(test_data, rsf_lp)
+boot_xgb_cindex     <- bootstrap_cindex_lp(test_data, xgb_lp)
+#boot_deep    <- bootstrap_cindex_lp(deep_test, deep_lp)
+
+
+cindex_df <- data.frame(
+  Model = c("Lasso", "Ridge", "ElasticNet", "RSF", "XGB"),
+  Cindex = c(
+    boot_lasso_cindex$t0,
+    boot_ridge_cindex$t0,
+    boot_elastic_cindex$t0,
+    boot_rsf_cindex$t0,
+    boot_xgb_cindex$t0
+  ),
+  LowerCI = c(
+    boot.ci(boot_lasso_cindex, type="perc")$percent[4],
+    boot.ci(boot_ridge_cindex, type="perc")$percent[4],
+    boot.ci(boot_elastic_cindex, type="perc")$percent[4],
+    boot.ci(boot_rsf_cindex, type="perc")$percent[4],
+    boot.ci(boot_xgb_cindex, type="perc")$percent[4]
+  ),
+  UpperCI = c(
+    boot.ci(boot_lasso_cindex, type="perc")$percent[5],
+    boot.ci(boot_ridge_cindex, type="perc")$percent[5],
+    boot.ci(boot_elastic_cindex, type="perc")$percent[5],
+    boot.ci(boot_rsf_cindex, type="perc")$percent[5],
+    boot.ci(boot_xgb_cindex, type="perc")$percent[5]
+  )
+)
+
+print(cindex_df)
+
+```
+#The estimated C-index values for the models were 0.586, 0.590, 0.616, 0.609, and 0.561, with standard errors ranging from 0.055 to 0.060. Among these, (Elastic Net Cox) achieved the highest C-index of 0.616, indicating that it has the best predictive discrimination for the outcome. This suggests that the Elastic Net Cox model outperforms Lasso, Ridge, Random Survival Forest, and XGBoost in terms of concordance, making it the preferred model based on C-index.
+
+```{r Penalized brier}
+
+#In survival analysis, it evaluates how well a model predicts the probability of an event  at a specific time.
+time_points <- c(100, 250,400) #Evaluation of predictions
+
+feature_names <- colnames(train_X)
+
+  
+  
+  # --- Wrap models ---
+  wrap_model <- function(fit) {
+    structure(list(fit = fit, lambda = "lambda.min", feature_names = predictors), class = "glmnet_surv_wrapper")
+  }
+  
+  lasso_wrapped   <- wrap_model(lasso_model)
+  ridge_wrapped   <- wrap_model(ridge_model)
+  elastic_wrapped <- wrap_model(elastic_model)
+  
+  # --- Define prediction methods ---
+predictSurvProb.glmnet_surv_wrapper <- function(object, newdata, times, ...) {
+  x_new <- model.matrix(reformulate(predictors), data = newdata)[, -1]
+  
+
+  
+  # Reorder to match training
+  x_new <- x_new[, object$feature_names, drop = FALSE]
+  
+  lp <- as.numeric(predict(object$fit, newx = x_new, s = object$lambda, type = "link"))
+  
+  base_cox <- coxph(Surv(surv_time, surv_event) ~ 1, data = newdata)
+  base_haz <- basehaz(base_cox, centered = FALSE)
+  H0 <- approx(base_haz$time, base_haz$hazard, xout = times, rule = 2)$y
+  
+  surv_probs <- outer(exp(lp), H0, function(r, h) exp(-r * h))
+  colnames(surv_probs) <- paste0("t_", times)
+  surv_probs
+}
+
+  
+  predictRisk.glmnet_surv_wrapper <- function(object, newdata, times, ...) {
+    1 - predictSurvProb(object, newdata = newdata, times = times, ...)
+  }
+  
+  # --- Bootstrap Brier function ---
+  bootstrap_brier_glmnet <- function(data, indices, model_wrapped, model_name, times) {
+    d <- data[indices, ]
+    Score(
+      object = setNames(list(model_wrapped), model_name),
+      formula = Surv(surv_time, surv_event) ~ 1,
+      data = d,
+      times = times,
+      metrics = "brier",
+      cens.model = "cox",
+      conservative = TRUE,
+      null.model = FALSE
+    )$Brier$score$Brier
+  }
+  
+  # --- Run bootstrap ---
+  set.seed(123)
+  boot_lasso <- boot(test_data, function(data, i) {
+    bootstrap_brier_glmnet(data, i, lasso_wrapped, "Lasso", time_points)
+  }, R = 200)
+  
+  boot_ridge <- boot(test_data, function(data, i) {
+    bootstrap_brier_glmnet(data, i, ridge_wrapped, "Ridge", time_points)
+  }, R = 200)
+  
+  boot_elastic <- boot(test_data, function(data, i) {
+    bootstrap_brier_glmnet(data, i, elastic_wrapped, "ElasticNet", time_points)
+  }, R = 200)
+  
+  # --- Extract CI ---
+  extract_ci <- function(boot_obj) {
+    lapply(seq_along(time_points), function(j) {
+      ci <- boot.ci(boot_obj, type = "perc", index = j)
+      c(lower = ci$percent[4], upper = ci$percent[5])
+    })
+  }
+  
+
+
+ summarize <- function(boot_obj, ci_list, model_name) {
+  n <- length(boot_obj$t0)
+  stopifnot(n == length(time_points))  # fail early if mismatch
+  
+  data.frame(
+    Fold    = rep(fold_i, n),
+    Model   = rep(model_name, n),
+    Time    = time_points,
+    Brier   = as.numeric(boot_obj$t0),
+    LowerCI = as.numeric(sapply(ci_list, `[[`, "lower")),
+    UpperCI = as.numeric(sapply(ci_list, `[[`, "upper")),
+    stringsAsFactors = FALSE
+  )
+}
+ 
+
+results_list <- list(
+  summarize(boot_lasso, extract_ci(boot_lasso), "Lasso"),
+  summarize(boot_ridge, extract_ci(boot_ridge), "Ridge"),
+  summarize(boot_elastic, extract_ci(boot_elastic), "ElasticNet")
+)
+
+
+```
+
+
+#Elastic Net Cox achieved Brier scores of 0.166, 0.237, and 0.204 at 100, 250, and 400 days, respectively, with confidence intervals
+
+#Lasso Cox  similar scores, slightly lower at 100 and 250 days (0.164 and 0.233) and comparable at 400 days (0.204), indicating similar predictive performance to Elastic Net.
+
+#Ridge Cox showed higher Brier scores at all time points (0.275, 0.345, and 0.262), suggesting lower prediction accuracy compared to Elastic Net and Lasso.
+
+
+```{r time dep brier  RSF}
+
+bootstrap_brier_riskreg <- function(data, indices, rsf_model, times) {
+  d <- data[indices, ]
+  
+  # Predict survival probabilities
+  surv_probs <- predictSurvProb(rsf_model, newdata = d, times = times)
+  
+  # Score
+  sc <- tryCatch({
+    Score(
+      object = list(RSF = surv_probs),
+      formula = Surv(surv_time, surv_event) ~ 1,
+      data = d,
+      times = times,
+      metrics = "brier",
+      cens.model = "cox",
+      conservative = TRUE,
+      null.model = FALSE
+    )
+  }, error = function(e) NULL)
+  
+  if (is.null(sc)) return(rep(NA_real_, length(times)))
+  
+  sc$Brier$score$Brier[sc$Brier$score$model == "RSF"]
+}
+
+set.seed(123)
+
+boot_rsf <- boot(
+  data = test_data,
+  statistic = function(data, i) {
+    bootstrap_brier_riskreg(data, i, rsf_model, time_points)
+  },
+  R = 200
+)
+
+rsf_brier_bootCI <- lapply(seq_along(time_points), function(j) {
+  boot.ci(boot_rsf, type = "perc", index = j)
+})
+
+rsf_brier <- data.frame( Model = "RSF",
+  Time = time_points,
+  Brier = boot_rsf$t0,
+  LowerCI = sapply(rsf_brier_bootCI, function(x) if(!is.null(x)) x$percent[4] else NA),
+  UpperCI = sapply(rsf_brier_bootCI, function(x) if(!is.null(x)) x$percent[5] else NA)
+)
+
+rsf_brier
+```
+
+```{r  time dep brier xgb}
+
+set.seed(123)
+
+# design matrices with consistent features
+formula <- ~ age + sex + ph.ecog + ph.karno + pat.karno + wt.loss
+train_X <- model.matrix(formula, data = train_data)[, -1]
+test_X  <- model.matrix(formula, data = test_data)[, -1]
+feature_names <- colnames(train_X)
+colnames(test_X) <- feature_names
+
+# XGBoost Cox model
+dtrain <- xgb.DMatrix(data = train_X, label = train_data$surv_time)
+setinfo(dtrain, "label_lower_bound", ifelse(train_data$surv_event == 1, train_data$surv_time, NA))
+setinfo(dtrain, "label_upper_bound", train_data$surv_time)
+
+xgb_model <- xgb.train(
+  params = list(
+    objective = "survival:cox",
+    eval_metric = "cox-nloglik",
+    eta = 0.05,
+    max_depth = 3,
+    subsample = 0.8,
+    colsample_bytree = 0.8
+  ),
+  data = dtrain,
+  nrounds = 300,
+  verbose = 0
+)
+
+# baseline cumulative hazard from Cox model
+cox_base <- coxph(Surv(surv_time, surv_event) ~ 1, data = train_data)
+base_haz <- basehaz(cox_base, centered = FALSE)
+
+#  Bootstrap estimation IPCW Brier score
+bootstrap_brier_xgb <- function(data, indices, xgb_model, base_haz, times, feature_names) {
+  d <- data[indices, ]
+  
+  x <- model.matrix(~ age + sex + ph.ecog + ph.karno + pat.karno + wt.loss, data = d)[,-1]
+  colnames(x) <- feature_names
+  dtest <- xgb.DMatrix(data = x)
+  
+  xgb_lp <- as.numeric(predict(xgb_model, newdata = test_X ))
+  H0 <- approx(base_haz$time, base_haz$hazard, xout = times, rule = 2)$y
+  
+  surv_probs <- outer(exp(xgb_lp), H0, function(r, h) exp(-r * h))
+  colnames(surv_probs) <- paste0("t_", times)
+  
+  sc <- Score(
+    object = list(XGB = surv_probs),
+    formula = Surv(surv_time, surv_event) ~ 1,
+    data = d,
+    times = times,
+    metrics = "brier",
+    cens.model = "cox",
+    conservative = TRUE,
+    null.model = FALSE
+  )
+  
+  sc$Brier$score$Brier[sc$Brier$score$model == "XGB"]
+}
+
+#  Run bootstrap -
+set.seed(123)
+boot_xgb <- boot(
+  data = test_data,
+  statistic = function(data, i) {
+    bootstrap_brier_xgb(data, i, xgb_model, base_haz, time_points, feature_names)
+  },
+  R = 200
+)
+
+#Extract CI
+xgb_ci <- lapply(seq_along(time_points), function(j) {
+  ci <- boot.ci(boot_xgb, type = "perc", index = j)
+  c(lower = ci$percent[4], upper = ci$percent[5])
+})
+
+
+xgb_summary <- data.frame( Model = "XGB",
+  Time    = time_points,
+  Brier   = boot_xgb$t0,
+  LowerCI = sapply(xgb_ci, `[[`, "lower"),
+  UpperCI = sapply(xgb_ci, `[[`, "upper")
+)
+
+print(xgb_summary)
+
+```
+
+#ElasticNet demonstrated the best performance in terms of Brier scores, consistently achieving low values across all time points (0.166 at 100 days, 0.237 at 250 days, 0.204 at 400 days), indicating the most accurate probability predictions.
+```{r  time dep   AUC all}
+library(timeROC)
+set.seed(123)
+# Bootstrap wrapper for timeROC
+boot_auc <- function(data, indices, marker, time_points) {
+  d <- data[indices, ]
+  roc <- timeROC(
+    T = d$surv_time,
+    delta = d$surv_event,
+    marker = marker[indices],
+    cause = 1,
+    times = time_points,
+    iid = FALSE
+  )
+  roc$AUC
+}
+
+# bootstrap 
+bootstrap_auc <- function(test_data, marker, time_points, R = 200, model_name = "Model") {
+  set.seed(123)
+  
+  boot_res <- boot(
+    data = test_data,
+    statistic = function(d, i) boot_auc(d, i, marker, time_points),
+    R = R
+  )
+  
+  roc_full <- timeROC(
+    T = test_data$surv_time,
+    delta = test_data$surv_event,
+    marker = marker,
+    cause = 1,
+    times = time_points,
+    iid = FALSE
+  )
+   
+  ci_list <- lapply(seq_along(time_points), function(j) {
+    ci <- tryCatch(boot.ci(boot_res, type = "perc", index = j), error = function(e) NULL)
+    if (is.null(ci)) {
+      c(lower = NA, upper = NA)
+    } else {
+      c(lower = ci$percent[4], upper = ci$percent[5])
+    }
+  })
+  
+  data.frame(
+    Model   = model_name,
+    Time    = time_points,
+    AUC     = round(roc_full$AUC, 3),
+    LowerCI = round(sapply(ci_list, `[[`, "lower"), 3),
+    UpperCI = round(sapply(ci_list, `[[`, "upper"), 3)
+  )
+}
+
+```
+
+```{r  AUC}
+set.seed(123)
+#AUC measures how well the model distinguishes between patients who experience the event versus those who do not.
+
+#Values closer to 1 indicate better discrimination; 0.5 indicates no better than chance.
+#Model linear predictors
+model_preds <- list(
+  Lasso     = lasso_lp,
+  Ridge     = ridge_lp,
+  ElasticNet= elastic_lp,
+  RSF       = rsf_lp,
+  XGB       = xgb_lp
+
+)
+
+# Run bootstrap AUC for all models
+auc_results <- lapply(names(model_preds), function(name) {
+  bootstrap_auc(test_data, model_preds[[name]], time_points, R = 200, model_name = name)
+})
+
+# Combine into one summary table
+auc_summary_all <- do.call(rbind, auc_results)
+
+print(auc_summary_all)
+
+```
+#ElasticNet performs best overall, with the highest AUC at 250 days (0.711) and strong discrimination at 100 (0.637) and 400 days (0.649). RSF is close behind at 250 days, while Lasso, Ridge, and XGBoost show moderate to lower discrimination.
+
+
+# Quantile-Based time Selection
+
+#  Extract event times only
+#event_times <- test_data$surv_time[test_data$surv_event == 1]
+
+# Choose quantiles ( 25%, 50%, 75%)
+#quantile_times <- quantile(event_times, probs = c(0.25, 0.5, 0.75))
+
+#  Round to nearest int
+#safe_time_points <- round(as.numeric(quantile_times))
+
+# Times
+#safe_time_points
+
+```{r}
+
+library(pROC)
+
+# ROC obj at  100 days
+roc_lasso_100 <- roc(test_data$death_100d, lasso_lp, smooth = TRUE, quiet = TRUE)
+roc_ridge_100 <- roc(test_data$death_100d, ridge_lp, smooth = TRUE, quiet = TRUE)
+roc_enet_100  <- roc(test_data$death_100d, elastic_lp, smooth = TRUE, quiet = TRUE)
+roc_rsf_100   <- roc(test_data$death_100d, rsf_lp, smooth = TRUE, quiet = TRUE)
+roc_xgb_100   <- roc(test_data$death_100d, xgb_lp, smooth = TRUE, quiet = TRUE)
+#roc_deep_100 <- roc(test_data_deep$death_100d, deep_lp, smooth = TRUE, quiet = TRUE)
+
+# ROC obj at 250 days
+roc_lasso_250 <- roc(test_data$death_250d, lasso_lp, smooth = TRUE, quiet = TRUE)
+roc_ridge_250 <- roc(test_data$death_250d, ridge_lp, smooth = TRUE, quiet = TRUE)
+roc_enet_250  <- roc(test_data$death_250d, elastic_lp, smooth = TRUE, quiet = TRUE)
+roc_rsf_250   <- roc(test_data$death_250d, rsf_lp, smooth = TRUE, quiet = TRUE)
+roc_xgb_250   <- roc(test_data$death_250d, xgb_lp, smooth = TRUE, quiet = TRUE)
+
+#ROC curves at 400 days
+roc_lasso_400 <- roc(test_data$death_400d, lasso_lp, smooth = TRUE, quiet = TRUE)
+roc_ridge_400 <- roc(test_data$death_400d, ridge_lp, smooth = TRUE, quiet = TRUE)
+roc_enet_400  <- roc(test_data$death_400d, elastic_lp, smooth = TRUE, quiet = TRUE)
+roc_rsf_400   <- roc(test_data$death_400d, rsf_lp, smooth = TRUE, quiet = TRUE)
+roc_xgb_400   <- roc(test_data$death_400d, xgb_lp, smooth = TRUE, quiet = TRUE)
+
+
+# ROC at 100 days
+
+plot(roc_ridge_100, col = "red", lwd = 2, main = "ROC at 100 Days", xlim = c(1,0), ylim = c(0,1))
+plot(roc_lasso_100, col = "pink", lwd = 2, add = TRUE)
+plot(roc_enet_100, col = "blue", lwd = 2, add = TRUE)
+plot(roc_rsf_100, col = "green", lwd = 2, add = TRUE)
+plot(roc_xgb_100, col = "purple", lwd = 2, add = TRUE)
+
+legend("bottomright", legend = c(
+  paste0("Lasso (AUC = ", round(auc(roc_lasso_100), 3), ")"),
+  paste0("Ridge (AUC = ", round(auc(roc_ridge_100), 3), ")"),
+  paste0("ElasticNet (AUC = ", round(auc(roc_enet_100), 3), ")"),
+  paste0("RSF (AUC = ", round(auc(roc_rsf_100), 3), ")"),
+  paste0("XGB (AUC = ", round(auc(roc_xgb_100), 3), ")")
+), col = c("pink", "red", "blue", "green", "purple"), lwd = 2, cex = 0.8, bty = "n", y.intersp = 1.2)
+
+# ROC at 250 days
+
+plot(roc_ridge_250, col = "red", lwd = 2, main = "ROC at 250 Days", xlim = c(1,0), ylim = c(0,1))
+plot(roc_lasso_250, col = "pink", lwd = 2, add = TRUE)
+plot(roc_enet_250, col = "blue", lwd = 2, add = TRUE)
+plot(roc_rsf_250, col = "green", lwd = 2, add = TRUE)
+plot(roc_xgb_250, col = "purple", lwd = 2, add = TRUE)
+
+legend("bottomright", legend = c(
+  paste0("Lasso (AUC = ", round(auc(roc_lasso_250), 3), ")"),
+  paste0("Ridge (AUC = ", round(auc(roc_ridge_250), 3), ")"),
+  paste0("ElasticNet (AUC = ", round(auc(roc_enet_250), 3), ")"),
+  paste0("RSF (AUC = ", round(auc(roc_rsf_250), 3), ")"),
+  paste0("XGB (AUC = ", round(auc(roc_xgb_250), 3), ")")
+), col = c("pink", "red", "blue", "green", "purple"), lwd = 2, cex = 0.8, bty = "n")
+
+# ROC at 400 days
+
+plot(roc_ridge_400, col = "red", lwd = 2, main = "ROC at 400 Days", xlim = c(1,0), ylim = c(0,1))
+plot(roc_lasso_400, col = "pink", lwd = 2, add = TRUE)
+plot(roc_enet_400, col = "blue", lwd = 2, add = TRUE)
+plot(roc_rsf_400, col = "green", lwd = 2, add = TRUE)
+plot(roc_xgb_400, col = "purple", lwd = 2, add = TRUE)
+
+legend("bottomright", legend = c(
+  paste0("Lasso (AUC = ", round(auc(roc_lasso_400), 3), ")"),
+  paste0("Ridge (AUC = ", round(auc(roc_ridge_400), 3), ")"),
+  paste0("ElasticNet (AUC = ", round(auc(roc_enet_400), 3), ")"),
+  paste0("RSF (AUC = ", round(auc(roc_rsf_400), 3), ")"),
+  paste0("XGB (AUC = ", round(auc(roc_xgb_400), 3), ")")
+), col = c("pink", "red", "blue", "green", "purple"), lwd = 2, cex = 0.8, bty = "n", y.intersp = 1.2)
+
+
+
+
+
+```
+```{r Calibration Plots}
+event_list <- list(
+  "100" = test_data$death_100d,
+  "250" = test_data$death_250d,
+  "400" = test_data$death_400d
+)
+
+
+get_calibration_summary <- function(pred_prob, event_t, model_name, t_horizon, plot = FALSE, B = 200) {
+  if(length(pred_prob) != length(event_t)) {
+    stop("Length mismatch: pred_prob and event_t must be the same.")
+  }
+
+  pred_prob <- pmin(pmax(pred_prob, 1e-6), 1 - 1e-6)
+  logit_pred <- qlogis(pred_prob)
+  df <- data.frame(event = event_t, logit_pred = logit_pred)
+
+  # Original models
+  cal_int_model <- glm(event ~ offset(logit_pred), family = binomial, data = df)
+  intercept <- coef(cal_int_model)[1]
+
+  cal_slope_model <- glm(event ~ logit_pred, family = binomial, data = df)
+  slope <- coef(cal_slope_model)[2]
+
+  # Bootstrap
+  boot_intercepts <- numeric(B)
+  boot_slopes <- numeric(B)
+
+  set.seed(123)
+  for (b in 1:B) {
+    idx <- sample(seq_len(nrow(df)), replace = TRUE)
+    boot_df <- df[idx, ]
+
+    boot_int <- tryCatch({
+      fit <- glm(event ~ offset(logit_pred), family = binomial, data = boot_df)
+      if (!fit$converged) NA else coef(fit)[1]
+    }, error = function(e) NA)
+
+    boot_slope <- tryCatch({
+      fit <- glm(event ~ logit_pred, family = binomial, data = boot_df)
+      if (!fit$converged) NA else coef(fit)[2]
+    }, error = function(e) NA)
+
+    boot_intercepts[b] <- boot_int
+    boot_slopes[b] <- boot_slope
+  }
+
+  # Remove NAs and compute percentile CIs
+  boot_intercepts <- na.omit(boot_intercepts)
+  boot_slopes <- na.omit(boot_slopes)
+
+  int_ci <- quantile(boot_intercepts, probs = c(0.025, 0.975))
+  slope_ci <- quantile(boot_slopes, probs = c(0.025, 0.975))
+
+  # Safe binning
+  qtiles <- quantile(pred_prob, probs = seq(0, 1, 0.1), na.rm = TRUE)
+  if (length(unique(qtiles)) < length(qtiles)) {
+    qtiles <- seq(min(pred_prob), max(pred_prob), length.out = 11)
+  }
+  deciles <- cut(pred_prob, breaks = qtiles, include.lowest = TRUE, labels = FALSE)
+
+  calib_df <- data.frame(
+    decile = deciles,
+    predicted = pred_prob,
+    observed = event_t
+  ) %>%
+    group_by(decile) %>%
+    summarise(
+      mean_predicted = mean(predicted),
+      mean_observed = mean(observed),
+      n = n(),
+      .groups = "drop"
+    ) %>%
+    mutate(Model = model_name, Time_Days = t_horizon)
+
+  if (plot) {
+    print(
+      ggplot(calib_df, aes(x = mean_predicted, y = mean_observed)) +
+        geom_point(size = 2, color = "darkgreen") +
+        geom_smooth(method = "loess", se = FALSE, color = "darkgreen") +
+        geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+        annotate("text", x = 0.05, y = 0.9,
+                 label = sprintf("Slope: %.2f (%.2f–%.2f)\nIntercept: %.2f (%.2f–%.2f)",
+                                 slope, slope_ci[1], slope_ci[2],
+                                 intercept, int_ci[1], int_ci[2]),
+                 hjust = 0, size = 4) +
+        labs(title = paste("Calibration:", model_name, "at", t_horizon, "days"),
+             x = "Predicted Probability", y = "Observed Proportion") +
+        theme_minimal()
+    )
+  }
+
+  return(list(
+    intercept = intercept,
+    intercept_CI = round(int_ci, 3),
+    intercept_CI_Width = round(diff(int_ci), 3),
+    slope = slope,
+    slope_CI = round(slope_ci, 3),
+    slope_CI_Width = round(diff(slope_ci), 3),
+    calib_curve = calib_df
+  ))
+}
+
+
+```
+```{r}
+
+run_model_calibration <- function(lp, event_list, model_name, B = 200) {
+  calib_curves <- list()
+  metrics_list <- list()
+
+  for (t in names(event_list)) {
+    event_t <- event_list[[t]]
+    lp_t <- (lp - min(lp)) / (max(lp) - min(lp))
+
+    result <- get_calibration_summary(
+      pred_prob = lp_t,
+      event_t = event_t,
+      model_name = model_name,
+      t_horizon = as.numeric(t),
+      plot = FALSE,
+      B = B
+    )
+
+    calib_curves[[t]] <- result$calib_curve
+    metrics_list[[t]] <- list(
+      Model = model_name,
+      Time_Days = as.numeric(t),
+      Intercept = result$intercept,
+      Intercept_Lower = result$intercept_CI[1],
+      Intercept_Upper = result$intercept_CI[2],
+      Intercept_CI_Width = result$intercept_CI_Width,
+      Slope = result$slope,
+      Slope_Lower = result$slope_CI[1],
+      Slope_Upper = result$slope_CI[2],
+      Slope_CI_Width = result$slope_CI_Width
+    )
+  }
+
+  calib_df <- bind_rows(calib_curves)
+  metrics_df <- bind_rows(metrics_list) %>%
+    distinct(Model, Time_Days, .keep_all = TRUE)
+
+  return(list(
+    calib_df = calib_df,
+    metrics_df = metrics_df
+  ))
+}
+
+```
+
+
+```{r}
+plot_calibration_loess <- function(calib_df, metrics_df, model_name, color_map) {
+  ggplot(calib_df, aes(x = mean_predicted, y = mean_observed)) +
+    geom_point(size = 2, color = color_map[model_name]) +
+    geom_smooth(method = "loess", se = FALSE, color = color_map[model_name]) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+    facet_wrap(~Time_Days, nrow = 1) +
+    geom_text(
+      data = metrics_df,
+      aes(x = 0.05, y = 0.9,
+          label = sprintf("Slope: %.2f (%.2f–%.2f)\nIntercept: %.2f (%.2f–%.2f)",
+                          Slope, Slope_Lower, Slope_Upper,
+                          Intercept, Intercept_Lower, Intercept_Upper)),
+      inherit.aes = FALSE,
+      hjust = 0, size = 4
+    ) +
+    labs(title = paste(model_name, ": Calibration Plot"),
+         x = "Predicted Probability",
+         y = "Observed Proportion") +
+    theme_minimal()
+}
+
+```
+
+```{r}
+colors <- c(
+ 
+  "RSF"        = "#7570b3", 
+  "GBM"        = "#e7298a",
+  "Lasso"      = "#66a61e",
+  "Ridge"      = "#e6ab02",
+  "ElasticNet" = "#a6761d"
+ 
+)
+
+
+lasso_results <- run_model_calibration(lasso_lp, event_list, "Lasso")
+lasso_plot <- plot_calibration_loess(lasso_results$calib_df, lasso_results$metrics_df, "Lasso", colors)
+
+ridge_results <- run_model_calibration(ridge_lp, event_list, "Ridge")
+ridge_plot <- plot_calibration_loess(ridge_results$calib_df, ridge_results$metrics_df, "Ridge", colors)
+
+enet_results <- run_model_calibration(elastic_lp, event_list, "ElasticNet")
+enet_plot <- plot_calibration_loess(enet_results$calib_df, enet_results$metrics_df, "ElasticNet", colors)
+
+rsf_results <- run_model_calibration(rsf_lp , event_list, "RSF")
+rsf_plot <- plot_calibration_loess(rsf_results$calib_df, rsf_results$metrics_df, "RSF", colors)
+
+gbm_results <- run_model_calibration(xgb_lp, event_list, "GBM")
+gbm_plot <- plot_calibration_loess(gbm_results$calib_df, gbm_results$metrics_df, "GBM", colors)
+
+
+
+slope_intercept <- bind_rows(
+  lasso_results$metrics_df,
+  ridge_results$metrics_df,
+  enet_results$metrics_df,
+  rsf_results$metrics_df,
+  gbm_results$metrics_df,
+
+)
+slope_intercept
+
+
+
+lasso_plot 
+ridge_plot 
+enet_plot 
+gbm_plot 
+rsf_plot
+```
+
+#Summary: ElasticNet and Lasso showed the best calibration across time points, with intercepts near zero and slopes closer to 1, whereas RSF and GBM tended to over- or under-predict risk and produced slopes below 1, indicating exaggerated risk differences.
+
+#Interpretation of intercepts and slopes:
+
+#Intercept: Measures systematic bias in predictions. An intercept of 0 means the model is neither consistently over- nor under-predicting risk. Positive values indicate underprediction (predicted risks too low), and negative values indicate overprediction (predicted risks too high).
+
+#Slope: Measures how well the predicted risks are spread relative to observed outcomes. A slope of 1 indicates perfect calibration (predicted risks match observed risk differences). Slopes <1 suggest predictions are too extreme (high-risk patients’ risks are overestimated, low-risk patients’ risks are underestimated), while slopes >1 indicate predictions are too moderate.
+```{r}
+# Extract sparse coefficient vector
+elastic_model
+
+optimal_lambda <- elastic_model$lambda.min
+
+coef_obj <- coef(elastic_model, s = optimal_lambda)
+coef_obj
+```
+#sex, ECOG performance status, and patient Karnofsky score—while shrinking age, physician Karnofsky score, meal calories, and weight loss to zero, indicating low predictive contribution.
+```{r}
+library(ggplot2)
+
+
+coef_df <- data.frame(
+  variable = rownames(coef_obj),
+  coefficient = as.numeric(coef_obj)
+)
+
+# Remove zero-coefficients (variables not selected)
+coef_df <- coef_df[coef_df$coefficient != 0, ]
+
+
+ggplot(coef_df, aes(x = reorder(variable, coefficient), y = coefficient)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Elastic Net Feature Importance (Coefficients)",
+    x = "Variable",
+    y = "Coefficient"
+  ) +
+  theme_minimal(base_size = 14)
+
+```
